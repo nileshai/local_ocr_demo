@@ -12,8 +12,22 @@ from PIL import Image
 
 load_dotenv()
 
-# NVIDIA API Key - default from .env
-NVIDIA_API_KEY = os.getenv("NGC_API_KEY", os.getenv("NVIDIA_API_KEY", ""))
+# NVIDIA API Key - from .env, environment, or Streamlit secrets
+def get_api_key():
+    # Try environment variables first
+    key = os.getenv("NGC_API_KEY", os.getenv("NVIDIA_API_KEY", ""))
+    if key:
+        return key
+    # Try Streamlit secrets (for Streamlit Cloud)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and 'NVIDIA_API_KEY' in st.secrets:
+            return st.secrets['NVIDIA_API_KEY']
+    except:
+        pass
+    return ""
+
+NVIDIA_API_KEY = get_api_key()
 
 # API Endpoints
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
