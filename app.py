@@ -1,62 +1,120 @@
 import json
 import os
+import io
+import base64
 import time
-import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Tuple, List
 
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from PIL import Image
 
 load_dotenv()
 
-# NV Ingest endpoint
-INGEST_URL = os.getenv("INGEST_URL", "http://localhost:8080/v1/convert")
-STATUS_URL = os.getenv("STATUS_URL", "http://localhost:8080/v1/status")
+# NVIDIA API Key - default from .env
+NVIDIA_API_KEY = os.getenv("NGC_API_KEY", os.getenv("NVIDIA_API_KEY", ""))
 
-# LLM endpoints
-LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://localhost:8000/v1/chat/completions")
+# API Endpoints
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_API_KEY = os.getenv("NGC_API_KEY", "")
+VISION_API_URL = "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-90b-vision-instruct/chat/completions"
 
-# Model options
+# Vision model for OCR
+VISION_MODEL = {
+    "name": "Llama 3.2 90B Vision",
+    "model": "meta/llama-3.2-90b-vision-instruct",
+    "url": VISION_API_URL,
+}
+
+# LLM models for entity extraction - Nemotron 3 Nano 30B is default
 MODEL_OPTIONS = {
-    "Local: Nemotron Nano 9B (Fast)": {
-        "url": LOCAL_LLM_URL,
-        "model": "nvidia/nvidia-nemotron-nano-9b-v2",
-        "is_local": True,
-        "description": "Locally deployed on GPU • Low latency • Best for real-time applications",
-    },
-    "API: Nemotron 3 Nano 30B (Accurate)": {
+    "Nemotron 3 Nano 30B (Default)": {
         "url": NVIDIA_API_URL,
         "model": "nvidia/nemotron-3-nano-30b-a3b",
-        "is_local": False,
-        "description": "NVIDIA Cloud API • Higher accuracy • Best for complex documents",
+        "description": "30B model • Great balance of speed & quality",
+    },
+    "Nemotron Super 49B (Accurate)": {
+        "url": NVIDIA_API_URL,
+        "model": "nvidia/llama-3.3-nemotron-super-49b-v1",
+        "description": "High accuracy • Best for complex docs",
+    },
+    "Llama 3.1 8B (Fast)": {
+        "url": NVIDIA_API_URL,
+        "model": "meta/llama-3.1-8b-instruct",
+        "description": "Fast inference • Quick results",
     },
 }
 
-TIMEOUT = int(os.getenv("NIM_TIMEOUT", "600"))  # 10 minutes for large documents
+TIMEOUT = int(os.getenv("NIM_TIMEOUT", "180"))
 
 # NVIDIA Brand Colors
 NVIDIA_GREEN = "#76B900"
 NVIDIA_DARK = "#1A1A1A"
 NVIDIA_GRAY = "#2D2D2D"
 
+# Optimized prompts for business documents
+VISION_OCR_PROMPT = """Extract ALL text from this document page. Include:
+- All form fields and their values
+- Checkbox states: [X] if checked, [ ] if unchecked
+- Handwritten text (mark as "(handwritten)")
+- Signatures (mark as "[SIGNATURE]")
+- All names, dates, ID numbers, amounts
+- Tables with all rows and columns
+- Section headers and labels
+
+Extract everything visible on this page:"""
+
+ENTITY_EXTRACTION_PROMPT = """You are a document data extraction system. Extract ALL information as raw entity pairs with page source.
+
+RULES:
+1. Extract ONLY what is present in the document - do NOT add fields that don't exist
+2. Use the EXACT field names as they appear in the document
+3. Preserve the EXACT values as written (numbers, dates, text)
+4. For checkboxes: Show "Yes" if checked/ticked, "No" if unchecked
+5. For handwritten text: Extract the value and note "(handwritten)"
+6. Include the PAGE NUMBER where each entity was found
+7. Include confidence score for each extraction
+
+OUTPUT FORMAT (use this exact table structure):
+
+| Page | Field | Value | Confidence |
+|------|-------|-------|------------|
+| 1 | [exact field name] | [exact value] | High/Medium/Low |
+| 1 | [checkbox label] | Yes/No | High/Medium/Low |
+| 2 | [field from page 2] | [value] | High/Medium/Low |
+
+For document tables (like line items), include each row:
+
+| Page | Field | Value | Confidence |
+|------|-------|-------|------------|
+| 1 | Line Item 1 - Description | [value] | High |
+| 1 | Line Item 1 - Amount | [value] | High |
+
+EXTRACTION SUMMARY (at the end):
+- Total fields extracted: [count]
+- Page 1: [count] fields
+- Page 2: [count] fields
+- High confidence: [count]
+- Medium confidence: [count]
+- Low confidence: [count]
+
+IMPORTANT: Only extract what EXISTS. Include page numbers for every field.
+
+DOCUMENT TEXT:
+"""
+
 
 def inject_custom_css():
     """Inject custom CSS for NVIDIA branding."""
     st.markdown(f"""
     <style>
-        /* Import fonts */
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         
-        /* Global styles */
         .stApp {{
             background: linear-gradient(135deg, {NVIDIA_DARK} 0%, #0D0D0D 50%, {NVIDIA_GRAY} 100%);
             font-family: 'Inter', sans-serif;
         }}
         
-        /* Header styling */
         .main-header {{
             background: linear-gradient(90deg, {NVIDIA_GREEN}22 0%, transparent 100%);
             border-left: 4px solid {NVIDIA_GREEN};
@@ -65,616 +123,429 @@ def inject_custom_css():
             border-radius: 0 12px 12px 0;
         }}
         
-        .main-title {{
-            color: white;
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin: 0;
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }}
-        
+        .main-title {{ color: white; font-size: 2.2rem; font-weight: 700; margin: 0; }}
         .nvidia-badge {{
             background: {NVIDIA_GREEN};
             color: black;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-weight: 600;
-            padding: 0.25rem 0.75rem;
+            padding: 0.2rem 0.6rem;
             border-radius: 4px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            margin-left: 1rem;
         }}
         
-        .main-subtitle {{
-            color: #E0E0E0;
-            font-size: 1.1rem;
-            margin-top: 0.5rem;
-            font-weight: 300;
-        }}
+        .main-subtitle {{ color: #E0E0E0; font-size: 1rem; margin-top: 0.5rem; }}
         
-        /* Pipeline visualization */
         .pipeline-container {{
             background: linear-gradient(135deg, {NVIDIA_GRAY}88 0%, {NVIDIA_DARK}88 100%);
             border: 1px solid #404040;
             border-radius: 16px;
-            padding: 2rem;
-            margin: 1.5rem 0;
+            padding: 1.5rem;
+            margin: 1rem 0;
         }}
         
-        .pipeline-title {{
-            color: {NVIDIA_GREEN};
-            font-size: 1.2rem;
-            font-weight: 600;
-            margin-bottom: 1.5rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }}
+        .pipeline-title {{ color: {NVIDIA_GREEN}; font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }}
         
         .pipeline-flow {{
             display: flex;
             align-items: center;
-            justify-content: space-between;
+            justify-content: space-around;
             flex-wrap: wrap;
-            gap: 1rem;
+            gap: 0.5rem;
         }}
         
         .pipeline-step {{
             background: linear-gradient(135deg, #333 0%, #222 100%);
             border: 1px solid #444;
-            border-radius: 12px;
-            padding: 1.25rem;
+            border-radius: 10px;
+            padding: 1rem;
             text-align: center;
-            flex: 1;
-            min-width: 140px;
-            transition: all 0.3s ease;
+            min-width: 100px;
         }}
         
-        .pipeline-step:hover {{
-            border-color: {NVIDIA_GREEN};
-            transform: translateY(-2px);
-            box-shadow: 0 8px 24px rgba(118, 185, 0, 0.15);
-        }}
-        
-        .step-icon {{
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
-        }}
-        
-        .step-name {{
-            color: white;
-            font-weight: 600;
-            font-size: 0.9rem;
-            margin-bottom: 0.25rem;
-        }}
-        
-        .step-tech {{
-            color: {NVIDIA_GREEN};
-            font-size: 0.75rem;
-            font-weight: 500;
-        }}
-        
-        .pipeline-arrow {{
-            color: {NVIDIA_GREEN};
-            font-size: 1.5rem;
-            font-weight: bold;
-        }}
-        
-        /* Card styling */
-        .info-card {{
-            background: linear-gradient(135deg, {NVIDIA_GRAY}66 0%, {NVIDIA_DARK}66 100%);
-            border: 1px solid #404040;
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin: 1rem 0;
-        }}
-        
-        .card-title {{
-            color: {NVIDIA_GREEN};
-            font-size: 0.9rem;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 0.75rem;
-        }}
-        
-        .card-content {{
-            color: #E0E0E0;
-            font-size: 0.95rem;
-            line-height: 1.6;
-        }}
-        
-        /* Status indicators */
-        .status-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-            margin: 1rem 0;
-        }}
+        .step-icon {{ font-size: 1.5rem; margin-bottom: 0.3rem; }}
+        .step-name {{ color: white; font-weight: 600; font-size: 0.8rem; }}
+        .step-tech {{ color: {NVIDIA_GREEN}; font-size: 0.7rem; }}
+        .pipeline-arrow {{ color: {NVIDIA_GREEN}; font-size: 1.2rem; }}
         
         .status-item {{
             background: #222;
             border-radius: 8px;
-            padding: 1rem;
+            padding: 0.8rem;
             display: flex;
             align-items: center;
-            gap: 0.75rem;
+            gap: 0.6rem;
+            margin: 0.3rem 0;
         }}
         
-        .status-dot {{
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            animation: pulse 2s infinite;
-        }}
+        .status-dot {{ width: 8px; height: 8px; border-radius: 50%; }}
+        .status-dot.online {{ background: {NVIDIA_GREEN}; box-shadow: 0 0 6px {NVIDIA_GREEN}; }}
+        .status-dot.offline {{ background: #FF4444; }}
         
-        .status-dot.online {{
-            background: {NVIDIA_GREEN};
-            box-shadow: 0 0 8px {NVIDIA_GREEN};
-        }}
-        
-        .status-dot.offline {{
-            background: #FF4444;
-            box-shadow: 0 0 8px #FF4444;
-        }}
-        
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.5; }}
-        }}
-        
-        .status-label {{
-            color: #E0E0E0;
-            font-size: 0.85rem;
-        }}
-        
-        .status-value {{
-            color: white;
-            font-weight: 500;
-        }}
-        
-        /* Results section */
         .results-header {{
             background: linear-gradient(90deg, {NVIDIA_GREEN} 0%, {NVIDIA_GREEN}88 100%);
             color: black;
-            padding: 1rem 1.5rem;
-            border-radius: 12px 12px 0 0;
+            padding: 0.8rem 1.2rem;
+            border-radius: 10px 10px 0 0;
             font-weight: 600;
-            font-size: 1.1rem;
         }}
         
         .results-body {{
             background: #1E1E1E;
             border: 1px solid #333;
             border-top: none;
-            border-radius: 0 0 12px 12px;
-            padding: 1.5rem;
+            border-radius: 0 0 10px 10px;
+            padding: 1.2rem;
         }}
         
-        /* Streamlit overrides */
         .stButton > button {{
             background: linear-gradient(135deg, {NVIDIA_GREEN} 0%, #5A9000 100%);
             color: black;
             font-weight: 600;
             border: none;
-            padding: 0.75rem 2rem;
+            padding: 0.6rem 1.5rem;
             border-radius: 8px;
-            font-size: 1rem;
-            transition: all 0.3s ease;
             width: 100%;
         }}
         
         .stButton > button:hover {{
             background: linear-gradient(135deg, #8BD000 0%, {NVIDIA_GREEN} 100%);
-            box-shadow: 0 4px 16px rgba(118, 185, 0, 0.4);
-            transform: translateY(-1px);
         }}
         
-        .stSelectbox label, .stTextArea label, .stTextInput label {{
-            color: #E0E0E0 !important;
-            font-weight: 500;
-        }}
-        
-        .stSelectbox > div > div {{
-            background: #2A2A2A;
-            border-color: #444;
-            color: #FFFFFF !important;
-        }}
-        
-        .stSelectbox > div > div > div {{
-            color: #FFFFFF !important;
-        }}
-        
-        div[data-baseweb="select"] span {{
-            color: #FFFFFF !important;
-        }}
-        
-        .stTextArea textarea {{
-            background: #2A2A2A;
-            border-color: #444;
-            color: white;
-        }}
-        
-        .stExpander {{
-            background: #222;
-            border: 1px solid #333;
-            border-radius: 8px;
-        }}
-        
-        div[data-testid="stExpander"] details summary p {{
-            color: #E0E0E0;
-        }}
-        
-        /* Sidebar */
         section[data-testid="stSidebar"] {{
             background: linear-gradient(180deg, {NVIDIA_DARK} 0%, #0A0A0A 100%);
             border-right: 1px solid #333;
         }}
         
-        section[data-testid="stSidebar"] .stMarkdown h3 {{
-            color: {NVIDIA_GREEN};
-            font-size: 0.9rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }}
+        .stMarkdown, .stMarkdown p {{ color: #E0E0E0 !important; }}
+        h1, h2, h3, h4, h5, h6 {{ color: #FFFFFF !important; }}
         
-        section[data-testid="stSidebar"] .stMarkdown p {{
-            color: #E0E0E0 !important;
-        }}
-        
-        section[data-testid="stSidebar"] .stCaption {{
-            color: #CCCCCC !important;
-        }}
-        
-        /* Footer */
-        .footer {{
-            text-align: center;
-            padding: 2rem;
-            color: #999;
-            font-size: 0.85rem;
-            border-top: 1px solid #333;
-            margin-top: 3rem;
-        }}
-        
-        .footer a {{
-            color: {NVIDIA_GREEN};
-            text-decoration: none;
-        }}
-        
-        /* Progress steps */
-        .step-indicator {{
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            padding: 0.75rem 1rem;
-            background: #222;
+        .stage-box {{
+            background: #1a1a2e;
             border-radius: 8px;
+            padding: 1rem;
             margin: 0.5rem 0;
+            border-left: 4px solid #444;
         }}
         
-        .step-number {{
-            background: {NVIDIA_GREEN};
-            color: black;
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 600;
-            font-size: 0.8rem;
-        }}
+        .stage-success {{ border-left-color: {NVIDIA_GREEN}; }}
+        .stage-error {{ border-left-color: #ff4444; }}
+        .stage-warning {{ border-left-color: #ffaa00; }}
+        .stage-info {{ border-left-color: #4488ff; }}
         
-        .step-text {{
-            color: white;
-            font-weight: 500;
-        }}
+        .confidence-high {{ color: {NVIDIA_GREEN}; font-weight: bold; }}
+        .confidence-medium {{ color: #ffaa00; font-weight: bold; }}
+        .confidence-low {{ color: #ff6666; font-weight: bold; }}
         
-        /* Fix all text visibility */
-        .stMarkdown, .stMarkdown p, .stMarkdown li {{
-            color: #E0E0E0 !important;
-        }}
-        
-        h1, h2, h3, h4, h5, h6 {{
-            color: #FFFFFF !important;
-        }}
-        
-        .stCaption, span[data-testid="stCaption"] {{
-            color: #CCCCCC !important;
-        }}
-        
-        /* Info text */
-        .stAlert p {{
-            color: #E0E0E0 !important;
-        }}
-        
-        /* Progress bar text */
-        div[data-testid="stProgressBar"] p, 
-        div[data-testid="stProgress"] p,
-        .stProgress p,
-        .stProgress > div > div > div > div {{
-            color: #FFFFFF !important;
-            font-weight: 500 !important;
-        }}
-        
-        /* Make progress text visible */
-        [data-testid="stMarkdownContainer"] p {{
-            color: #FFFFFF !important;
-        }}
-        
-        /* Hide default elements */
-        #MainMenu {{visibility: hidden;}}
-        footer {{visibility: hidden;}}
-        header {{visibility: hidden;}}
+        #MainMenu, footer, header {{visibility: hidden;}}
     </style>
     """, unsafe_allow_html=True)
 
 
 def render_header():
-    """Render the main header with NVIDIA branding."""
     st.markdown("""
     <div class="main-header">
         <h1 class="main-title">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="#76B900">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-            </svg>
-            Intelligent Document Processing
-            <span class="nvidia-badge">Powered by NVIDIA</span>
+            Document Intelligence
+            <span class="nvidia-badge">NVIDIA Vision + LLM</span>
         </h1>
         <p class="main-subtitle">
-            Enterprise-grade OCR and Entity Extraction using NVIDIA's AI Infrastructure
+            Multi-Page Vision OCR + Entity Extraction with Confidence Scores
         </p>
     </div>
     """, unsafe_allow_html=True)
 
 
 def render_pipeline_diagram():
-    """Render the pipeline visualization."""
     st.markdown("""
     <div class="pipeline-container">
-        <div class="pipeline-title">🔄 Processing Pipeline Architecture</div>
+        <div class="pipeline-title">🔄 Multi-Page Vision OCR Pipeline</div>
         <div class="pipeline-flow">
             <div class="pipeline-step">
                 <div class="step-icon">📄</div>
-                <div class="step-name">Document Input</div>
-                <div class="step-tech">PDF / Image</div>
+                <div class="step-name">PDF</div>
+                <div class="step-tech">All Pages</div>
             </div>
             <div class="pipeline-arrow">→</div>
             <div class="pipeline-step">
-                <div class="step-icon">🔍</div>
-                <div class="step-name">NV-Ingest</div>
-                <div class="step-tech">OCR & Extraction</div>
+                <div class="step-icon">🖼️</div>
+                <div class="step-name">Images</div>
+                <div class="step-tech">Per Page</div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+            <div class="pipeline-step">
+                <div class="step-icon">👁️</div>
+                <div class="step-name">Vision OCR</div>
+                <div class="step-tech">Llama 3.2 90B</div>
             </div>
             <div class="pipeline-arrow">→</div>
             <div class="pipeline-step">
                 <div class="step-icon">🧠</div>
-                <div class="step-name">Nemotron LLM</div>
-                <div class="step-tech">Entity Analysis</div>
+                <div class="step-name">Extract</div>
+                <div class="step-tech">Nemotron 30B</div>
             </div>
             <div class="pipeline-arrow">→</div>
             <div class="pipeline-step">
                 <div class="step-icon">📊</div>
-                <div class="step-name">Structured Output</div>
-                <div class="step-tech">Key-Value Pairs</div>
+                <div class="step-name">Entities</div>
+                <div class="step-tech">+ Confidence</div>
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
 
-def render_info_section():
-    """Render information about the pipeline."""
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("""
-        <div class="info-card">
-            <div class="card-title">🚀 NV-Ingest OCR Engine</div>
-            <div class="card-content">
-                NVIDIA's high-performance document processing microservice extracts text, 
-                tables, and structured content from PDFs and images using GPU-accelerated 
-                computer vision models. Optimized for enterprise throughput.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div class="info-card">
-            <div class="card-title">🤖 Nemotron Language Model</div>
-            <div class="card-content">
-                NVIDIA's Nemotron LLMs provide state-of-the-art natural language 
-                understanding for entity extraction, document comprehension, and structured 
-                data generation. Deployed as NVIDIA NIM for optimized inference.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-
-def check_service_status():
-    """Check and return service status."""
-    services = {}
-    try:
-        r = requests.get("http://localhost:8080/v1/health/ready", timeout=3)
-        services["nv_ingest"] = r.status_code == 200
-    except:
-        services["nv_ingest"] = False
-    
-    try:
-        r = requests.get("http://localhost:8000/v1/health/ready", timeout=3)
-        services["local_llm"] = r.status_code == 200
-    except:
-        services["local_llm"] = False
-    
-    return services
-
-
-def render_status_indicators(services: dict):
-    """Render service status indicators."""
-    nv_status = "online" if services.get("nv_ingest") else "offline"
-    llm_status = "online" if services.get("local_llm") else "offline"
+def show_stage(name: str, status: str, message: str, data: Any = None):
+    """Display a processing stage with status."""
+    icons = {"success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️", "processing": "⏳"}
+    icon = icons.get(status, "•")
+    css_class = f"stage-{status}" if status in ["success", "error", "warning", "info"] else ""
     
     st.markdown(f"""
-    <div class="status-grid">
-        <div class="status-item">
-            <div class="status-dot {nv_status}"></div>
-            <div>
-                <div class="status-label">NV-Ingest OCR</div>
-                <div class="status-value">{'Ready' if services.get('nv_ingest') else 'Offline'}</div>
-            </div>
-        </div>
-        <div class="status-item">
-            <div class="status-dot {llm_status}"></div>
-            <div>
-                <div class="status-label">Nemotron LLM</div>
-                <div class="status-value">{'Ready' if services.get('local_llm') else 'Offline'}</div>
-            </div>
-        </div>
+    <div class="stage-box {css_class}">
+        <strong>{icon} {name}</strong><br>
+        <span style="color: #aaa; font-size: 0.9rem;">{message}</span>
     </div>
     """, unsafe_allow_html=True)
+    
+    if data is not None:
+        with st.expander(f"📋 {name} - Details"):
+            if isinstance(data, (dict, list)):
+                st.json(data)
+            else:
+                st.code(str(data)[:5000])
 
 
-def call_ingest(file_bytes: bytes, filename: str, progress_bar=None, status_text=None) -> Dict[str, Any]:
-    """Use NV Ingest /v1/convert endpoint to process document."""
-    job_id = str(uuid.uuid4())
+def pdf_to_images(file_bytes: bytes, dpi: int = 150) -> Tuple[List[Image.Image], Dict]:
+    """Convert ALL PDF pages to images using pdf2image."""
+    from pdf2image import convert_from_bytes
     
-    ext = os.path.splitext(filename)[1].lower()
+    info = {"method": "pdf2image", "dpi": dpi}
     
-    # Map file extensions to valid document types and MIME types
-    # NV-Ingest expects "jpeg" not "jpg" for JPEG images
-    if ext == ".pdf":
-        mime_type = "application/pdf"
-    elif ext == ".jpg":
-        mime_type = "image/jpeg"
-        # Rename file to .jpeg for NV-Ingest compatibility
-        filename = filename.rsplit('.', 1)[0] + ".jpeg"
-    elif ext == ".jpeg":
-        mime_type = "image/jpeg"
-    elif ext == ".png":
-        mime_type = "image/png"
-    else:
-        mime_type = "application/pdf"
+    try:
+        images = convert_from_bytes(file_bytes, dpi=dpi)
+        info["pages"] = len(images)
+        info["success"] = True
+        return images, info
+    except Exception as e:
+        info["error"] = str(e)
+        info["success"] = False
+        return [], info
+
+
+def image_to_base64(image: Image.Image, max_dim: int = 1024) -> Tuple[str, Dict]:
+    """Convert PIL Image to base64, resizing if needed."""
+    info = {"original_size": f"{image.width}x{image.height}"}
     
-    files = [("files", (filename, file_bytes, mime_type))]
-    data = {
-        "job_id": job_id,
-        "extract_text": "true",
-        "extract_images": "true",
-        "extract_tables": "true",
+    # Resize if too large
+    if image.width > max_dim or image.height > max_dim:
+        ratio = min(max_dim / image.width, max_dim / image.height)
+        new_size = (int(image.width * ratio), int(image.height * ratio))
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+        info["resized_to"] = f"{image.width}x{image.height}"
+    
+    # Convert to base64
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    
+    info["base64_length"] = len(b64)
+    return b64, info
+
+
+def call_vision_ocr(image_b64: str, api_key: str, page_num: int = 1, total_pages: int = 1) -> Tuple[str, str, Dict]:
+    """Call Vision model for OCR on a single page."""
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
     
-    if progress_bar:
-        progress_bar.progress(5, text="Uploading document...")
+    # Simple, direct prompt that works well
+    prompt = VISION_OCR_PROMPT
     
-    resp = requests.post(INGEST_URL, files=files, data=data, timeout=TIMEOUT)
-    resp.raise_for_status()
-    result = resp.json()
+    payload = {
+        "model": "meta/llama-3.2-90b-vision-instruct",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.1,
+    }
     
-    if progress_bar:
-        progress_bar.progress(15, text="Document uploaded, processing...")
+    details = {
+        "model": "llama-3.2-90b-vision-instruct",
+        "page": page_num,
+        "total_pages": total_pages,
+    }
     
-    if result.get("status") == "processing":
-        task_id = result.get("task_id", job_id)
-        return poll_for_result(task_id, progress_bar=progress_bar, status_text=status_text)
-    
-    if progress_bar:
-        progress_bar.progress(50, text="OCR extraction complete!")
-    
-    return result
-
-
-def poll_for_result(task_id: str, max_wait: int = 300, progress_bar=None, status_text=None) -> Dict[str, Any]:
-    """Poll for job completion (5 min timeout for large documents)."""
-    start = time.time()
-    poll_count = 0
-    while time.time() - start < max_wait:
-        elapsed = time.time() - start
-        # Progress from 15% to 50% during OCR polling
-        progress_pct = min(15 + int((elapsed / max_wait) * 35), 50)
+    try:
+        response = requests.post(VISION_API_URL, headers=headers, json=payload, timeout=180)
+        details["status_code"] = response.status_code
         
-        if progress_bar:
-            progress_bar.progress(progress_pct, text=f"Processing document... {progress_pct}%")
+        if response.status_code == 200:
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            details["usage"] = data.get("usage", {})
+            details["output_length"] = len(content)
+            return content, "success", details
+        else:
+            details["error"] = response.text[:500]
+            return "", f"HTTP {response.status_code}", details
+            
+    except requests.Timeout:
+        details["error"] = "Request timed out (180s)"
+        return "", "timeout", details
+    except Exception as e:
+        details["error"] = str(e)
+        return "", "error", details
+
+
+def process_all_pages(
+    images: List[Image.Image], 
+    api_key: str, 
+    progress_callback=None,
+    status_container=None
+) -> Tuple[str, List[Dict]]:
+    """Process ALL pages with Vision OCR and combine results."""
+    
+    all_text = []
+    page_details = []
+    total_pages = len(images)
+    
+    for i, img in enumerate(images):
+        page_num = i + 1
         
-        resp = requests.get(f"{STATUS_URL}/{task_id}", timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("status") == "completed":
-                if progress_bar:
-                    progress_bar.progress(50, text="OCR extraction complete!")
-                return data
-        poll_count += 1
-        time.sleep(3)
-    raise TimeoutError(f"Job {task_id} did not complete in {max_wait}s")
+        if progress_callback:
+            progress_callback(f"Processing page {page_num}/{total_pages}...")
+        
+        if status_container:
+            status_container.info(f"👁️ OCR processing page {page_num} of {total_pages}...")
+        
+        # Convert to base64
+        image_b64, b64_info = image_to_base64(img, max_dim=1024)
+        
+        # Call Vision OCR for this page
+        text, status, details = call_vision_ocr(image_b64, api_key, page_num, total_pages)
+        
+        details["page"] = page_num
+        details["image_info"] = b64_info
+        details["status"] = status
+        page_details.append(details)
+        
+        if status == "success" and text:
+            all_text.append(f"\n{'='*60}\n📄 PAGE {page_num} OF {total_pages}\n{'='*60}\n\n{text}")
+            if status_container:
+                status_container.success(f"✅ Page {page_num}: Extracted {len(text):,} characters")
+        else:
+            error_msg = details.get("error", status)
+            all_text.append(f"\n{'='*60}\n📄 PAGE {page_num} OF {total_pages} - ERROR\n{'='*60}\n\n[OCR Failed: {error_msg}]")
+            if status_container:
+                status_container.error(f"❌ Page {page_num}: {error_msg}")
+        
+        # Small delay between API calls to avoid rate limiting
+        if page_num < total_pages:
+            time.sleep(1)
+    
+    combined_text = "\n".join(all_text)
+    return combined_text, page_details
 
 
-def call_llm(prompt: str, model_config: dict, api_key: str) -> str:
-    """Call LLM for inference (local or API)."""
+def call_entity_extraction(
+    text: str,
+    model_config: dict,
+    api_key: str,
+    total_pages: int = 1,
+) -> Tuple[str, str, Dict]:
+    """Call LLM for entity extraction with confidence scores."""
     import re
     
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
     
-    if not model_config["is_local"] and api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    # Use more text for multi-page documents
+    max_chars = min(20000, len(text))
+    full_prompt = f"{ENTITY_EXTRACTION_PROMPT}\n{text[:max_chars]}"
+    
+    # Add reminder about all pages
+    if total_pages > 1:
+        full_prompt += f"\n\nIMPORTANT: This document has {total_pages} pages. Extract entities from ALL {total_pages} pages. Make sure to include fields from every page."
     
     body = {
         "model": model_config["model"],
         "messages": [
-            {"role": "system", "content": "You are an assistant that extracts and formats key-value entities from document text. Be concise and structured. Output only the final result."},
-            {"role": "user", "content": prompt},
+            {
+                "role": "system",
+                "content": f"You are a document extraction system. Extract ALL fields from ALL {total_pages} pages. Include the page number for each field. Do not stop until you have extracted every field from every page."
+            },
+            {"role": "user", "content": full_prompt}
         ],
-        "temperature": 0.2,
-        "max_tokens": 4096,
+        "temperature": 0.1,
+        "max_tokens": 8192,
     }
     
-    resp = requests.post(model_config["url"], headers=headers, json=body, timeout=TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    details = {
+        "model": model_config["model"],
+        "prompt_length": len(full_prompt),
+    }
     
-    if "</think>" in content:
-        content = content.split("</think>")[-1].strip()
-    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-    
-    return content
-
-
-def extract_text_from_result(result: Any) -> str:
-    """Extract text content from nv-ingest result."""
-    if isinstance(result, dict):
-        if "result" in result and isinstance(result["result"], list):
-            texts = []
-            for item in result["result"]:
-                if isinstance(item, dict) and "content" in item:
-                    texts.append(item["content"])
-            if texts:
-                return "\n".join(texts)
+    try:
+        resp = requests.post(model_config["url"], headers=headers, json=body, timeout=TIMEOUT)
+        details["status_code"] = resp.status_code
         
-        for key in ["text", "content", "extracted_text", "data"]:
-            if key in result:
-                val = result[key]
-                if isinstance(val, str):
-                    return val
-                return extract_text_from_result(val)
+        if resp.status_code != 200:
+            details["error"] = resp.text[:500]
+            return "", f"HTTP {resp.status_code}", details
         
-        texts = []
-        for v in result.values():
-            t = extract_text_from_result(v)
-            if t:
-                texts.append(t)
-        return "\n".join(texts)
-    elif isinstance(result, list):
-        texts = []
-        for item in result:
-            t = extract_text_from_result(item)
-            if t:
-                texts.append(t)
-        return "\n".join(texts)
-    elif isinstance(result, str):
-        return result
-    return ""
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        
+        # Clean thinking tags
+        if "</think>" in content:
+            content = content.split("</think>")[-1].strip()
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        
+        details["usage"] = data.get("usage", {})
+        details["output_length"] = len(content)
+        
+        return content, "success", details
+        
+    except requests.Timeout:
+        details["error"] = "Request timed out"
+        return "", "timeout", details
+    except Exception as e:
+        details["error"] = str(e)
+        return "", "error", details
 
 
-def main() -> None:
+def process_image_file(file_bytes: bytes, filename: str) -> Tuple[List[Image.Image], Dict]:
+    """Load an image file directly."""
+    info = {"method": "direct_image", "filename": filename}
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        info["size"] = f"{img.width}x{img.height}"
+        info["format"] = img.format
+        info["pages"] = 1
+        info["success"] = True
+        return [img], info
+    except Exception as e:
+        info["error"] = str(e)
+        info["success"] = False
+        return [], info
+
+
+def main():
     st.set_page_config(
         page_title="NVIDIA Document Intelligence",
         page_icon="🟢",
@@ -686,165 +557,272 @@ def main() -> None:
     
     # Sidebar
     with st.sidebar:
-        st.markdown("### 🤖 Model Selection")
+        st.markdown("### 🧠 Entity Extraction Model")
         selected_model = st.selectbox(
-            "Choose LLM",
+            "Choose Model",
             options=list(MODEL_OPTIONS.keys()),
-            index=0,
-            help="Select the language model for entity extraction"
+            index=0
         )
         model_config = MODEL_OPTIONS[selected_model]
-        
         st.caption(model_config["description"])
         
-        api_key = ""
-        if not model_config["is_local"]:
-            st.markdown("### 🔑 API Configuration")
-            api_key = st.text_input("NVIDIA API Key", value=NVIDIA_API_KEY, type="password")
-            if not api_key:
-                st.warning("⚠️ API key required")
+        st.markdown("### 👁️ Vision OCR Model")
+        st.markdown(f"""
+        <div class="status-item">
+            <div class="status-dot online"></div>
+            <div class="status-value">Llama 3.2 90B Vision</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption("Processes ALL pages with checkbox detection")
         
-        st.markdown("### 📝 Extraction Prompt")
-        custom_prompt = st.text_area(
-            "Customize the extraction prompt",
-            value="Extract all key-value entities from the following document. Format as a clean markdown table with columns: Field, Value. Include all relevant information such as names, dates, amounts, addresses, and identifiers.",
-            height=120,
-            label_visibility="collapsed"
+        st.markdown("### 🔑 NVIDIA API Key")
+        api_key = st.text_input(
+            "API Key",
+            value=NVIDIA_API_KEY,
+            type="password",
+            help="From build.nvidia.com"
         )
         
-        st.markdown("### 📡 System Status")
-        services = check_service_status()
-        render_status_indicators(services)
+        if api_key and len(api_key) > 20:
+            st.markdown(f"""
+            <div class="status-item" style="background: #1a3d1a;">
+                <div class="status-dot online"></div>
+                <div class="status-value">API Key Configured</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning("⚠️ Enter API key")
+        
+        st.markdown("### ℹ️ Features")
+        st.markdown("""
+        - ✅ **Multi-page processing**
+        - ✅ **Checkbox detection**
+        - ✅ **Confidence scores**
+        - ✅ **Business document optimized**
+        """)
+        
+        st.markdown("---")
+        st.caption("📄 Supports: PDF (all pages), PNG, JPG")
     
     # Main content
     render_header()
     render_pipeline_diagram()
-    render_info_section()
     
-    # Upload section
     st.markdown("---")
     st.markdown("### 📤 Upload Document")
     
     uploaded = st.file_uploader(
         "Drop your PDF or image file here",
         type=["pdf", "png", "jpg", "jpeg"],
-        help="Supported formats: PDF, PNG, JPG, JPEG"
+        help="PDF files: ALL pages will be processed"
     )
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        run_button = st.button("🚀 Process Document", type="primary", use_container_width=True)
+        run_button = st.button(
+            "🚀 Process Document",
+            type="primary",
+            use_container_width=True
+        )
     
     if uploaded and run_button:
-        services = check_service_status()
-        
-        if not services.get("nv_ingest"):
-            st.error("❌ NV-Ingest service is offline. Please ensure the service is running.")
+        if not api_key or len(api_key) < 20:
+            st.error("❌ Please enter a valid NVIDIA API key in the sidebar.")
             return
         
-        if not model_config["is_local"] and not api_key:
-            st.error("❌ API key required for cloud model. Please enter your NVIDIA API key.")
-            return
-        
-        if model_config["is_local"] and not services.get("local_llm"):
-            st.error("❌ Local LLM service is offline. Please ensure the service is running or switch to API model.")
-            return
-        
-        # Processing
         st.markdown("---")
-        st.markdown("### ⚡ Processing Results")
+        st.markdown("### ⚡ Processing Pipeline")
         
-        # Create progress bar
-        progress_bar = st.progress(0, text="Starting pipeline...")
+        progress = st.progress(0, text="Starting...")
         status_text = st.empty()
+        file_bytes = uploaded.read()
+        ext = os.path.splitext(uploaded.name)[1].lower()
         
-        try:
-            # Step 1: OCR
-            st.markdown("""
-            <div class="step-indicator">
-                <div class="step-number">1</div>
-                <div class="step-text">Extracting text with NV-Ingest OCR...</div>
-            </div>
-            """, unsafe_allow_html=True)
+        # ===== STAGE 1: File Input =====
+        st.markdown("#### 📁 Stage 1: Document Input")
+        show_stage(
+            "File Received",
+            "success",
+            f"**{uploaded.name}** | {len(file_bytes):,} bytes | Type: {ext}"
+        )
+        progress.progress(10, text="File received...")
+        
+        # ===== STAGE 2: Convert to Images (ALL PAGES) =====
+        st.markdown("#### 🖼️ Stage 2: Image Conversion (All Pages)")
+        progress.progress(15, text="Converting to images...")
+        
+        if ext == ".pdf":
+            images, conv_info = pdf_to_images(file_bytes, dpi=150)
+            if images:
+                show_stage(
+                    "PDF → Images",
+                    "success",
+                    f"Converted **{len(images)} page(s)** at 150 DPI",
+                    conv_info
+                )
+            else:
+                show_stage("PDF Conversion", "error", f"Failed: {conv_info.get('error')}", conv_info)
+                st.error("❌ Could not convert PDF. Install poppler: `brew install poppler`")
+                return
+        else:
+            images, conv_info = process_image_file(file_bytes, uploaded.name)
+            if images:
+                show_stage(
+                    "Image Loaded",
+                    "success",
+                    f"Size: {conv_info.get('size')} | Format: {conv_info.get('format')}",
+                    conv_info
+                )
+            else:
+                show_stage("Image Load", "error", f"Failed: {conv_info.get('error')}", conv_info)
+                return
+        
+        total_pages = len(images)
+        progress.progress(20, text=f"Processing {total_pages} page(s)...")
+        
+        # ===== STAGE 3: Vision OCR (ALL PAGES) =====
+        st.markdown(f"#### 👁️ Stage 3: Vision OCR ({total_pages} pages)")
+        
+        # Create a container to show per-page status
+        page_status_container = st.container()
+        
+        def update_progress(msg):
+            status_text.text(msg)
+        
+        ocr_text, page_details = process_all_pages(
+            images, 
+            api_key, 
+            progress_callback=update_progress,
+            status_container=page_status_container
+        )
+        
+        # Calculate stats
+        successful_pages = sum(1 for d in page_details if d.get("output_length", 0) > 0)
+        total_chars = len(ocr_text)
+        
+        progress.progress(60, text="OCR complete...")
+        status_text.empty()
+        
+        if successful_pages > 0:
+            show_stage(
+                "Vision OCR Complete",
+                "success",
+                f"Processed **{successful_pages}/{total_pages}** pages | "
+                f"Total: {total_chars:,} characters",
+                {"pages": page_details}
+            )
             
-            ingest_result = call_ingest(uploaded.read(), uploaded.name, progress_bar=progress_bar, status_text=status_text)
-            progress_bar.progress(50, text="OCR complete! 50%")
-            st.success("✅ Document processed successfully!")
+            # Show per-page OCR summary
+            st.markdown("**📄 Per-Page OCR Results:**")
+            for detail in page_details:
+                page_num = detail.get("page", "?")
+                chars = detail.get("output_length", 0)
+                status = detail.get("status", "unknown")
+                if status == "success":
+                    st.success(f"Page {page_num}: ✅ {chars:,} characters extracted")
+                else:
+                    st.error(f"Page {page_num}: ❌ {detail.get('error', status)}")
             
-            with st.expander("📋 View Raw OCR Output"):
-                st.json(ingest_result)
-            
-            extracted_text = extract_text_from_result(ingest_result)
-            if not extracted_text.strip():
-                extracted_text = json.dumps(ingest_result, indent=2)
-            
-            # Step 2: Show extracted text
-            progress_bar.progress(55, text="Text extracted! 55%")
-            st.markdown("""
-            <div class="step-indicator">
-                <div class="step-number">2</div>
-                <div class="step-text">Extracted Document Content</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            with st.expander("📄 View Extracted Text", expanded=False):
-                st.text_area("", value=extracted_text, height=200, disabled=True, label_visibility="collapsed")
-            
-            # Step 3: LLM Analysis
-            progress_bar.progress(60, text="Sending to LLM for analysis... 60%")
-            st.markdown(f"""
-            <div class="step-indicator">
-                <div class="step-number">3</div>
-                <div class="step-text">Analyzing with {model_config['model'].split('/')[-1]}...</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            progress_bar.progress(70, text="LLM processing... 70%")
-            full_prompt = f"{custom_prompt}\n\nDocument content:\n{extracted_text[:8000]}"
-            llm_response = call_llm(full_prompt, model_config, api_key)
-            
-            progress_bar.progress(100, text="Complete! 100%")
-            st.success("✅ Entity extraction complete!")
-            
-            # Results display
-            st.markdown("""
-            <div class="results-header">
-                📊 Extracted Entities
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown(f"""
-            <div class="results-body">
-            """, unsafe_allow_html=True)
-            
-            st.markdown(llm_response)
-            
+            # Show OCR result with page markers visible
+            with st.expander("📝 Complete OCR Text (All Pages)", expanded=False):
+                st.text_area(
+                    "Extracted Text",
+                    value=ocr_text,
+                    height=400,
+                    disabled=True
+                )
+                st.caption(f"Total: {len(ocr_text):,} characters from {total_pages} pages")
+        else:
+            show_stage("Vision OCR", "error", "Failed to process any pages", {"pages": page_details})
+            return
+        
+        # ===== STAGE 4: Entity Extraction with Confidence =====
+        st.markdown(f"#### 🧠 Stage 4: Entity Extraction with Confidence Scores")
+        progress.progress(70, text="Extracting entities...")
+        
+        # Verify we have content from all pages
+        pages_in_text = ocr_text.count("📄 PAGE")
+        if pages_in_text < total_pages:
+            st.warning(f"⚠️ OCR text contains {pages_in_text} page markers but expected {total_pages}. Some pages may not have been processed.")
+        
+        show_stage(
+            "LLM Analysis",
+            "info",
+            f"Model: {model_config['model']} | Input: {len(ocr_text):,} chars | "
+            f"Pages detected: {pages_in_text} | Extracting ALL entities..."
+        )
+        
+        with st.spinner(f"🧠 Analyzing {total_pages} page(s) with {selected_model}..."):
+            entities, entity_status, entity_details = call_entity_extraction(
+                ocr_text, model_config, api_key, total_pages
+            )
+        
+        progress.progress(90, text="Entity extraction complete...")
+        
+        if entity_status == "success" and entities:
+            show_stage(
+                "Entity Extraction Complete",
+                "success",
+                f"Output: {len(entities):,} characters | "
+                f"Tokens: {entity_details.get('usage', {}).get('total_tokens', 'N/A')}",
+                entity_details
+            )
+        else:
+            show_stage("Entity Extraction", "error", f"Status: {entity_status}", entity_details)
+        
+        # ===== STAGE 5: Results with Confidence =====
+        st.markdown("#### 📊 Stage 5: Extracted Entities with Confidence")
+        progress.progress(100, text="Complete!")
+        
+        if entities:
+            st.markdown("""<div class="results-header">📊 Extracted Entities with Confidence Scores</div>""", 
+                       unsafe_allow_html=True)
+            st.markdown("""<div class="results-body">""", unsafe_allow_html=True)
+            st.markdown(entities)
             st.markdown("</div>", unsafe_allow_html=True)
             
-        except requests.HTTPError as e:
-            progress_bar.progress(0, text="Error!")
-            st.error(f"❌ HTTP Error: {e.response.status_code}")
-            with st.expander("Error Details"):
-                st.code(e.response.text[:1000])
-        except TimeoutError as e:
-            progress_bar.progress(0, text="Timeout!")
-            st.error(f"❌ Timeout: {e}")
-        except Exception as e:
-            progress_bar.progress(0, text="Error!")
-            st.error(f"❌ Error: {e}")
-            import traceback
-            with st.expander("Error Details"):
-                st.code(traceback.format_exc())
+            st.success(f"✅ Document processing complete! ({total_pages} pages processed)")
+            
+            # Download options
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.download_button(
+                    "📥 Entities (MD)",
+                    entities,
+                    file_name=f"{uploaded.name}_entities.md",
+                    mime="text/markdown"
+                )
+            with col2:
+                st.download_button(
+                    "📥 OCR Text",
+                    ocr_text,
+                    file_name=f"{uploaded.name}_ocr.txt",
+                    mime="text/plain"
+                )
+            with col3:
+                # Create JSON export
+                export_data = {
+                    "filename": uploaded.name,
+                    "pages_processed": total_pages,
+                    "ocr_text": ocr_text,
+                    "entities_markdown": entities,
+                    "page_details": page_details,
+                    "model_used": model_config["model"]
+                }
+                st.download_button(
+                    "📥 Full JSON",
+                    json.dumps(export_data, indent=2),
+                    file_name=f"{uploaded.name}_full.json",
+                    mime="application/json"
+                )
+        else:
+            st.error("❌ No entities extracted. Check error details above.")
     
     # Footer
     st.markdown("""
-    <div class="footer">
-        <p>Built with <span style="color: #76B900;">NVIDIA</span> • 
-        <a href="https://build.nvidia.com" target="_blank">NVIDIA AI Platform</a> • 
-        <a href="https://github.com/NVIDIA/nv-ingest" target="_blank">NV-Ingest</a></p>
-        <p style="font-size: 0.75rem; margin-top: 0.5rem;">
-            Enterprise Document Intelligence Solution
-        </p>
+    <div style="text-align: center; padding: 2rem; color: #666; border-top: 1px solid #333; margin-top: 2rem;">
+        Powered by <span style="color: #76B900;">NVIDIA</span> • 
+        Multi-Page Vision OCR + Entity Extraction with Confidence Scores
     </div>
     """, unsafe_allow_html=True)
 

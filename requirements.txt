@@ -1,4 +1,6 @@
-streamlit==1.41.1
-requests==2.32.3
-python-dotenv==1.0.1
-
+nv-ingest==25.9.0
+nv-ingest-api==25.9.0
+nv-ingest-client==25.9.0
+streamlit>=1.41.0
+requests>=2.32.0
+python-dotenv>=1.0.0

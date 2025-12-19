@@ -1,152 +1,120 @@
-# OCR + LLM Demo with NVIDIA NIM
+# Local OCR Demo
 
-A document processing pipeline that extracts text from PDFs using NVIDIA NV Ingest and performs entity extraction using Nemotron LLM.
+A document processing pipeline that uses NVIDIA Vision-Language Models for OCR and Nemotron LLM for entity extraction.
 
 ## Architecture
 
 ```
-PDF/Image → NV Ingest (OCR) → Nemotron 49B LLM (Entity Extraction) → Structured Output
+PDF → Image (Poppler) → Vision OCR (Llama 3.2 90B) → Entity Extraction (Nemotron 30B) → Structured Output
 ```
 
 ## Features
 
-- **Document OCR**: Extract text from PDFs and images using NVIDIA NV Ingest
-- **Entity Extraction**: Extract key-value pairs using Nemotron 49B v1.5 LLM
-- **Web UI**: Streamlit-based interface for easy testing
-- **GPU Accelerated**: Runs on NVIDIA A100 GPUs
+- **Multi-Page Processing**: Processes ALL pages in PDF documents
+- **Vision-Based OCR**: Uses Llama 3.2 90B Vision model for accurate text extraction
+- **Checkbox Detection**: Identifies checked/unchecked boxes in forms
+- **Handwritten Text**: Extracts and marks handwritten content
+- **Confidence Scores**: Each extracted entity includes a confidence level
+- **Page Source Tracking**: Know which page each entity came from
+- **Business Document Optimized**: Designed for invoices, forms, applications
 
 ## Prerequisites
 
-- Docker with NVIDIA Container Toolkit
-- NVIDIA GPU (tested on A100 80GB)
-- NVIDIA NGC API Key
+- Python 3.12
+- Poppler (for PDF to image conversion)
+- NVIDIA API Key from [build.nvidia.com](https://build.nvidia.com)
 
 ## Quick Start
 
-### 1. Clone and Setup
+### 1. Install Poppler (macOS)
 
 ```bash
-git clone <your-repo-url>
-cd ocr-demo
-
-# Copy environment template and add your NGC API key
-cp env.sample .env
-# Edit .env and set NGC_API_KEY=your-key-here
+brew install poppler
 ```
 
-### 2. Start Services
+### 2. Clone and Setup
 
 ```bash
-# Start Redis and NV Ingest
-docker compose up -d redis nv-ingest
+git clone https://github.com/nileshai/local_ocr_demo.git
+cd local_ocr_demo
 
-# Wait for services to be ready
-sleep 30
-curl http://localhost:8080/v1/health/ready
-```
-
-### 3. Run the UI
-
-```bash
 # Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
-# Run Streamlit
+### 3. Configure API Key
+
+```bash
+# Create .env file
+echo "NVIDIA_API_KEY=your-api-key-here" > .env
+```
+
+### 4. Run the App
+
+```bash
 streamlit run app.py --server.address 0.0.0.0 --server.port 8501
 ```
 
-### 4. Access the App
+### 5. Open in Browser
 
-Open `http://localhost:8501` in your browser.
+Navigate to `http://localhost:8501`
+
+## Pipeline Stages
+
+| Stage | Component | Description |
+|-------|-----------|-------------|
+| 1 | File Input | Upload PDF or image |
+| 2 | Image Conversion | PDF to images via Poppler (150 DPI) |
+| 3 | Vision OCR | Llama 3.2 90B Vision extracts text per page |
+| 4 | Entity Extraction | Nemotron 30B structures entities with confidence |
+| 5 | Results | Markdown table with page source |
+
+## Output Format
+
+```markdown
+| Page | Field | Value | Confidence |
+|------|-------|-------|------------|
+| 1 | Company Name | Emerald Tech Limited | High |
+| 1 | Registration No | CRO/2025/IE/004512 | High |
+| 2 | Signatory Name | Mark Ryan | High |
+| 2 | Signature | (handwritten) | Medium |
+```
+
+## Models Used
+
+| Model | Purpose | Provider |
+|-------|---------|----------|
+| Llama 3.2 90B Vision | OCR / Text Extraction | NVIDIA API |
+| Nemotron 3 Nano 30B | Entity Extraction | NVIDIA API |
 
 ## Configuration
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `NGC_API_KEY` | NVIDIA NGC API Key | Required |
-| `INGEST_URL` | NV Ingest endpoint | `http://localhost:8080/v1/convert` |
-| `LLM_API_URL` | NVIDIA LLM API endpoint | `https://integrate.api.nvidia.com/v1/chat/completions` |
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `NVIDIA_API_KEY` | API key from build.nvidia.com | Yes |
+| `NGC_API_KEY` | Alternative API key name | No |
 
-### Docker Services
+### Supported File Types
 
-| Service | Port | Description |
-|---------|------|-------------|
-| `redis` | 6379 | Message broker for NV Ingest |
-| `nv-ingest` | 8080 | Document OCR/extraction |
-| `nemotron-parse` | 8002 | Vision-based parsing (optional) |
-| `retriever` | 8001 | Page element detection (optional) |
-
-## Usage
-
-1. Upload a PDF or image file
-2. The pipeline will:
-   - Extract text using NV Ingest OCR
-   - Send to Nemotron 49B for entity extraction
-   - Display structured key-value pairs
-
-## API Reference
-
-### NV Ingest
-
-```bash
-# Submit document
-curl -X POST http://localhost:8080/v1/convert \
-  -F "files=@document.pdf" \
-  -F "job_id=test-123" \
-  -F "extract_text=true"
-
-# Check status
-curl http://localhost:8080/v1/status/test-123
-```
-
-### NVIDIA LLM API
-
-```bash
-curl -X POST "https://integrate.api.nvidia.com/v1/chat/completions" \
-  -H "Authorization: Bearer $NGC_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-    "messages": [{"role": "user", "content": "Extract entities from..."}],
-    "max_tokens": 1000
-  }'
-```
+- PDF (multi-page supported)
+- PNG
+- JPG / JPEG
 
 ## Project Structure
 
 ```
-ocr-demo/
+local_ocr_demo/
 ├── app.py              # Streamlit application
-├── docker-compose.yaml # Docker services configuration
 ├── requirements.txt    # Python dependencies
-├── env.sample          # Environment template
-├── .streamlit/         # Streamlit configuration
-│   └── config.toml
+├── .env               # API key (create this)
+├── .gitignore
 └── README.md
-```
-
-## Troubleshooting
-
-### NV Ingest not responding
-```bash
-# Check service health
-curl http://localhost:8080/v1/health/ready
-
-# Check logs
-docker compose logs nv-ingest
-```
-
-### Redis connection errors
-```bash
-# Ensure Redis is running
-docker compose up -d redis
-docker compose logs redis
 ```
 
 ## License
@@ -155,6 +123,6 @@ MIT License
 
 ## Acknowledgments
 
-- [NVIDIA NV Ingest](https://github.com/NVIDIA/nv-ingest)
-- [NVIDIA NIM](https://build.nvidia.com)
-- [Nemotron 49B](https://build.nvidia.com/nvidia/llama-3_3-nemotron-super-49b-v1_5)
+- [NVIDIA Build](https://build.nvidia.com) - API Platform
+- [Llama 3.2 Vision](https://ai.meta.com/llama/) - Vision Language Model
+- [Streamlit](https://streamlit.io) - Web UI Framework
