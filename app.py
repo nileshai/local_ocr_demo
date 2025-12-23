@@ -33,11 +33,22 @@ NVIDIA_API_KEY = get_api_key()
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 VISION_API_URL = "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-90b-vision-instruct/chat/completions"
 
-# Vision model for OCR
-VISION_MODEL = {
-    "name": "Llama 3.2 90B Vision",
-    "model": "meta/llama-3.2-90b-vision-instruct",
-    "url": VISION_API_URL,
+# OCR Model Options
+OCR_MODEL_OPTIONS = {
+    "Llama 3.2 90B Vision (Default)": {
+        "name": "Llama 3.2 90B Vision",
+        "model": "meta/llama-3.2-90b-vision-instruct",
+        "url": VISION_API_URL,
+        "type": "vision_llm",
+        "description": "High accuracy Vision LLM • Best for forms & handwriting",
+    },
+    "Llama 3.2 11B Vision (Faster)": {
+        "name": "Llama 3.2 11B Vision",
+        "model": "meta/llama-3.2-11b-vision-instruct",
+        "url": "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-11b-vision-instruct/chat/completions",
+        "type": "vision_llm",
+        "description": "Faster inference • Good for simple documents",
+    },
 }
 
 # LLM models for entity extraction - Nemotron 3 Nano 30B is default
@@ -78,41 +89,50 @@ VISION_OCR_PROMPT = """Extract ALL text from this document page. Include:
 
 Extract everything visible on this page:"""
 
-ENTITY_EXTRACTION_PROMPT = """You are a document data extraction system. Extract ALL information as raw entity pairs with page source.
+ENTITY_EXTRACTION_PROMPT = """You are a document data extraction system for business automation. Extract ALL information as entity pairs with confidence scores.
 
 RULES:
-1. Extract ONLY what is present in the document - do NOT add fields that don't exist
-2. Use the EXACT field names as they appear in the document
-3. Preserve the EXACT values as written (numbers, dates, text)
-4. For checkboxes: Show "Yes" if checked/ticked, "No" if unchecked
-5. For handwritten text: Extract the value and note "(handwritten)"
-6. Include the PAGE NUMBER where each entity was found
-7. Include confidence score for each extraction
+1. Extract ONLY what is present - do NOT invent fields
+2. Use EXACT field names as they appear in the document
+3. Preserve EXACT values (numbers, dates, text, formatting)
+4. For checkboxes: "✓ Yes" if checked, "✗ No" if unchecked
+5. For handwritten text: Include value with "(handwritten)" note
+6. For signatures: Mark as "[Signature Present]"
+7. Include PAGE NUMBER for each field
+8. Include CONFIDENCE SCORE (0.0 to 1.0) for each extraction
 
-OUTPUT FORMAT (use this exact table structure):
+CONFIDENCE SCORING:
+- 0.95-1.00: Printed text, clearly legible, standard format
+- 0.85-0.94: Clear but with minor formatting variations
+- 0.70-0.84: Readable with some ambiguity
+- 0.50-0.69: Partially legible, handwritten, or uncertain
+- Below 0.50: Low confidence, needs manual review
+
+OUTPUT FORMAT:
 
 | Page | Field | Value | Confidence |
 |------|-------|-------|------------|
-| 1 | [exact field name] | [exact value] | High/Medium/Low |
-| 1 | [checkbox label] | Yes/No | High/Medium/Low |
-| 2 | [field from page 2] | [value] | High/Medium/Low |
+| 1 | [field name] | [value] | 0.95 |
+| 1 | [checkbox] | ✓ Yes | 0.98 |
+| 2 | [handwritten field] | [value] (handwritten) | 0.72 |
 
-For document tables (like line items), include each row:
-
+For tables/line items:
 | Page | Field | Value | Confidence |
 |------|-------|-------|------------|
-| 1 | Line Item 1 - Description | [value] | High |
-| 1 | Line Item 1 - Amount | [value] | High |
+| 1 | Item 1 - Description | [value] | 0.97 |
+| 1 | Item 1 - Amount | $X.XX | 0.98 |
 
-EXTRACTION SUMMARY (at the end):
-- Total fields extracted: [count]
-- Page 1: [count] fields
-- Page 2: [count] fields
-- High confidence: [count]
-- Medium confidence: [count]
-- Low confidence: [count]
-
-IMPORTANT: Only extract what EXISTS. Include page numbers for every field.
+EXTRACTION SUMMARY:
+```
+Total Fields: [count]
+By Page: Page 1: [n], Page 2: [n]
+By Confidence:
+  - High (≥0.90): [count] fields
+  - Medium (0.70-0.89): [count] fields  
+  - Low (<0.70): [count] fields
+Average Confidence: [0.XX]
+Overall Reliability: [High/Medium/Low]
+```
 
 DOCUMENT TEXT:
 """
@@ -367,8 +387,18 @@ def image_to_base64(image: Image.Image, max_dim: int = 1024) -> Tuple[str, Dict]
     return b64, info
 
 
-def call_vision_ocr(image_b64: str, api_key: str, page_num: int = 1, total_pages: int = 1) -> Tuple[str, str, Dict]:
+def call_vision_ocr(
+    image_b64: str, 
+    api_key: str, 
+    page_num: int = 1, 
+    total_pages: int = 1,
+    ocr_config: dict = None
+) -> Tuple[str, str, Dict]:
     """Call Vision model for OCR on a single page."""
+    
+    # Default to Llama 3.2 90B Vision if no config provided
+    if ocr_config is None:
+        ocr_config = OCR_MODEL_OPTIONS["Llama 3.2 90B Vision (Default)"]
     
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -379,7 +409,7 @@ def call_vision_ocr(image_b64: str, api_key: str, page_num: int = 1, total_pages
     prompt = VISION_OCR_PROMPT
     
     payload = {
-        "model": "meta/llama-3.2-90b-vision-instruct",
+        "model": ocr_config["model"],
         "messages": [
             {
                 "role": "user",
@@ -397,13 +427,14 @@ def call_vision_ocr(image_b64: str, api_key: str, page_num: int = 1, total_pages
     }
     
     details = {
-        "model": "llama-3.2-90b-vision-instruct",
+        "model": ocr_config["model"],
+        "model_name": ocr_config["name"],
         "page": page_num,
         "total_pages": total_pages,
     }
     
     try:
-        response = requests.post(VISION_API_URL, headers=headers, json=payload, timeout=180)
+        response = requests.post(ocr_config["url"], headers=headers, json=payload, timeout=180)
         details["status_code"] = response.status_code
         
         if response.status_code == 200:
@@ -428,7 +459,8 @@ def process_all_pages(
     images: List[Image.Image], 
     api_key: str, 
     progress_callback=None,
-    status_container=None
+    status_container=None,
+    ocr_config: dict = None
 ) -> Tuple[str, List[Dict]]:
     """Process ALL pages with Vision OCR and combine results."""
     
@@ -449,7 +481,7 @@ def process_all_pages(
         image_b64, b64_info = image_to_base64(img, max_dim=1024)
         
         # Call Vision OCR for this page
-        text, status, details = call_vision_ocr(image_b64, api_key, page_num, total_pages)
+        text, status, details = call_vision_ocr(image_b64, api_key, page_num, total_pages, ocr_config)
         
         details["page"] = page_num
         details["image_info"] = b64_info
@@ -580,14 +612,15 @@ def main():
         model_config = MODEL_OPTIONS[selected_model]
         st.caption(model_config["description"])
         
-        st.markdown("### 👁️ Vision OCR Model")
-        st.markdown(f"""
-        <div class="status-item">
-            <div class="status-dot online"></div>
-            <div class="status-value">Llama 3.2 90B Vision</div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.caption("Processes ALL pages with checkbox detection")
+        st.markdown("### 👁️ OCR Model")
+        selected_ocr = st.selectbox(
+            "Choose OCR Model",
+            options=list(OCR_MODEL_OPTIONS.keys()),
+            index=0,
+            key="ocr_model"
+        )
+        ocr_config = OCR_MODEL_OPTIONS[selected_ocr]
+        st.caption(ocr_config["description"])
         
         st.markdown("### 🔑 NVIDIA API Key")
         api_key = st.text_input(
@@ -695,7 +728,7 @@ def main():
         progress.progress(20, text=f"Processing {total_pages} page(s)...")
         
         # ===== STAGE 3: Vision OCR (ALL PAGES) =====
-        st.markdown(f"#### 👁️ Stage 3: Vision OCR ({total_pages} pages)")
+        st.markdown(f"#### 👁️ Stage 3: OCR with {ocr_config['name']} ({total_pages} pages)")
         
         # Create a container to show per-page status
         page_status_container = st.container()
@@ -707,7 +740,8 @@ def main():
             images, 
             api_key, 
             progress_callback=update_progress,
-            status_container=page_status_container
+            status_container=page_status_container,
+            ocr_config=ocr_config
         )
         
         # Calculate stats
