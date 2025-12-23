@@ -34,20 +34,29 @@ NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 VISION_API_URL = "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-90b-vision-instruct/chat/completions"
 
 # OCR Model Options
+NEMO_OCR_URL = "https://ai.api.nvidia.com/v1/cv/nvidia/nemoretriever-ocr-v1"
+
 OCR_MODEL_OPTIONS = {
-    "Llama 3.2 90B Vision (Default)": {
+    "NemoRetriever OCR v1 (Default)": {
+        "name": "NemoRetriever OCR v1",
+        "model": "nvidia/nemoretriever-ocr-v1",
+        "url": NEMO_OCR_URL,
+        "type": "nemo_ocr",
+        "description": "NVIDIA OCR • Per-word confidence • Fast & accurate",
+    },
+    "Llama 3.2 90B Vision (Best Quality)": {
         "name": "Llama 3.2 90B Vision",
         "model": "meta/llama-3.2-90b-vision-instruct",
         "url": VISION_API_URL,
         "type": "vision_llm",
-        "description": "High accuracy Vision LLM • Best for forms & handwriting",
+        "description": "Vision LLM • Best for complex forms & handwriting",
     },
     "Llama 3.2 11B Vision (Faster)": {
         "name": "Llama 3.2 11B Vision",
         "model": "meta/llama-3.2-11b-vision-instruct",
         "url": "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-11b-vision-instruct/chat/completions",
         "type": "vision_llm",
-        "description": "Faster inference • Good for simple documents",
+        "description": "Faster Vision LLM • Good for simple documents",
     },
 }
 
@@ -367,9 +376,14 @@ def pdf_to_images(file_bytes: bytes, dpi: int = 150) -> Tuple[List[Image.Image],
         return [], info
 
 
-def image_to_base64(image: Image.Image, max_dim: int = 1024) -> Tuple[str, Dict]:
+def image_to_base64(
+    image: Image.Image, 
+    max_dim: int = 1024, 
+    format: str = "PNG",
+    quality: int = 85
+) -> Tuple[str, Dict]:
     """Convert PIL Image to base64, resizing if needed."""
-    info = {"original_size": f"{image.width}x{image.height}"}
+    info = {"original_size": f"{image.width}x{image.height}", "format": format}
     
     # Resize if too large
     if image.width > max_dim or image.height > max_dim:
@@ -380,7 +394,15 @@ def image_to_base64(image: Image.Image, max_dim: int = 1024) -> Tuple[str, Dict]
     
     # Convert to base64
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    if format.upper() == "JPEG":
+        # Convert to RGB if needed (JPEG doesn't support alpha)
+        if image.mode in ('RGBA', 'LA', 'P'):
+            image = image.convert('RGB')
+        image.save(buffer, format="JPEG", quality=quality)
+        info["jpeg_quality"] = quality
+    else:
+        image.save(buffer, format="PNG")
+    
     b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
     
     info["base64_length"] = len(b64)
@@ -398,7 +420,7 @@ def call_vision_ocr(
     
     # Default to Llama 3.2 90B Vision if no config provided
     if ocr_config is None:
-        ocr_config = OCR_MODEL_OPTIONS["Llama 3.2 90B Vision (Default)"]
+        ocr_config = OCR_MODEL_OPTIONS["Llama 3.2 90B Vision (Best Quality)"]
     
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -455,6 +477,95 @@ def call_vision_ocr(
         return "", "error", details
 
 
+def call_nemo_ocr(
+    image_b64: str, 
+    api_key: str, 
+    page_num: int = 1, 
+    total_pages: int = 1,
+    ocr_config: dict = None
+) -> Tuple[str, str, Dict]:
+    """Call NemoRetriever OCR v1 for structured OCR with per-word confidence."""
+    
+    if ocr_config is None:
+        ocr_config = OCR_MODEL_OPTIONS["NemoRetriever OCR v1 (Default)"]
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    
+    # NemoRetriever requires base64 < 180,000 chars
+    # If image is too large, we need to compress it
+    if len(image_b64) >= 180_000:
+        # Return error - caller should resize
+        return "", "image_too_large", {
+            "error": f"Base64 too large ({len(image_b64)} chars). Max 180,000 for NemoRetriever.",
+            "page": page_num,
+        }
+    
+    payload = {
+        "input": [
+            {
+                "type": "image_url",
+                "url": f"data:image/jpeg;base64,{image_b64}"
+            }
+        ]
+    }
+    
+    details = {
+        "model": ocr_config["model"],
+        "model_name": ocr_config["name"],
+        "page": page_num,
+        "total_pages": total_pages,
+        "base64_length": len(image_b64),
+    }
+    
+    try:
+        response = requests.post(ocr_config["url"], headers=headers, json=payload, timeout=120)
+        details["status_code"] = response.status_code
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Parse NemoRetriever response format
+            text_parts = []
+            confidence_scores = []
+            
+            for item in data.get("data", []):
+                for detection in item.get("text_detections", []):
+                    pred = detection.get("text_prediction", {})
+                    text = pred.get("text", "")
+                    conf = pred.get("confidence", 0.0)
+                    if text:
+                        text_parts.append(text)
+                        confidence_scores.append(conf)
+            
+            combined_text = "\n".join(text_parts)
+            
+            # Calculate average confidence
+            avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
+            
+            details["num_detections"] = len(text_parts)
+            details["avg_confidence"] = round(avg_confidence, 3)
+            details["min_confidence"] = round(min(confidence_scores), 3) if confidence_scores else 0
+            details["max_confidence"] = round(max(confidence_scores), 3) if confidence_scores else 0
+            details["output_length"] = len(combined_text)
+            details["raw_detections"] = data.get("data", [])[:5]  # Store first 5 for debug
+            
+            return combined_text, "success", details
+        else:
+            details["error"] = response.text[:500]
+            return "", f"HTTP {response.status_code}", details
+            
+    except requests.Timeout:
+        details["error"] = "Request timed out (120s)"
+        return "", "timeout", details
+    except Exception as e:
+        details["error"] = str(e)
+        return "", "error", details
+
+
 def process_all_pages(
     images: List[Image.Image], 
     api_key: str, 
@@ -462,11 +573,15 @@ def process_all_pages(
     status_container=None,
     ocr_config: dict = None
 ) -> Tuple[str, List[Dict]]:
-    """Process ALL pages with Vision OCR and combine results."""
+    """Process ALL pages with OCR and combine results."""
     
     all_text = []
     page_details = []
     total_pages = len(images)
+    
+    # Determine OCR type
+    ocr_type = ocr_config.get("type", "vision_llm") if ocr_config else "vision_llm"
+    is_nemo_ocr = ocr_type == "nemo_ocr"
     
     for i, img in enumerate(images):
         page_num = i + 1
@@ -475,13 +590,27 @@ def process_all_pages(
             progress_callback(f"Processing page {page_num}/{total_pages}...")
         
         if status_container:
-            status_container.info(f"👁️ OCR processing page {page_num} of {total_pages}...")
+            model_name = ocr_config.get("name", "OCR") if ocr_config else "OCR"
+            status_container.info(f"👁️ {model_name}: Processing page {page_num} of {total_pages}...")
         
-        # Convert to base64
-        image_b64, b64_info = image_to_base64(img, max_dim=1024)
+        # Convert to base64 - use smaller size for NemoRetriever (180K limit)
+        if is_nemo_ocr:
+            # NemoRetriever needs smaller images to stay under 180K base64 limit
+            # Use JPEG compression for smaller size
+            image_b64, b64_info = image_to_base64(img, max_dim=600, format="JPEG", quality=75)
+            
+            # If still too large, try smaller
+            if len(image_b64) >= 180_000:
+                image_b64, b64_info = image_to_base64(img, max_dim=400, format="JPEG", quality=60)
+        else:
+            # Vision LLM can handle larger images
+            image_b64, b64_info = image_to_base64(img, max_dim=1024)
         
-        # Call Vision OCR for this page
-        text, status, details = call_vision_ocr(image_b64, api_key, page_num, total_pages, ocr_config)
+        # Call appropriate OCR function based on type
+        if is_nemo_ocr:
+            text, status, details = call_nemo_ocr(image_b64, api_key, page_num, total_pages, ocr_config)
+        else:
+            text, status, details = call_vision_ocr(image_b64, api_key, page_num, total_pages, ocr_config)
         
         details["page"] = page_num
         details["image_info"] = b64_info
@@ -491,7 +620,13 @@ def process_all_pages(
         if status == "success" and text:
             all_text.append(f"\n{'='*60}\n📄 PAGE {page_num} OF {total_pages}\n{'='*60}\n\n{text}")
             if status_container:
-                status_container.success(f"✅ Page {page_num}: Extracted {len(text):,} characters")
+                # Show confidence for NemoRetriever OCR
+                if is_nemo_ocr and "avg_confidence" in details:
+                    conf = details["avg_confidence"]
+                    num_det = details.get("num_detections", 0)
+                    status_container.success(f"✅ Page {page_num}: {num_det} detections, avg confidence: {conf:.2f}")
+                else:
+                    status_container.success(f"✅ Page {page_num}: Extracted {len(text):,} characters")
         else:
             error_msg = details.get("error", status)
             all_text.append(f"\n{'='*60}\n📄 PAGE {page_num} OF {total_pages} - ERROR\n{'='*60}\n\n[OCR Failed: {error_msg}]")
@@ -760,14 +895,22 @@ def main():
                 {"pages": page_details}
             )
             
-            # Show per-page OCR summary
+            # Show per-page OCR summary with confidence for NemoRetriever
             st.markdown("**📄 Per-Page OCR Results:**")
             for detail in page_details:
                 page_num = detail.get("page", "?")
                 chars = detail.get("output_length", 0)
                 status = detail.get("status", "unknown")
                 if status == "success":
-                    st.success(f"Page {page_num}: ✅ {chars:,} characters extracted")
+                    # Check if NemoRetriever (has confidence scores)
+                    if "avg_confidence" in detail:
+                        conf = detail["avg_confidence"]
+                        num_det = detail.get("num_detections", 0)
+                        min_conf = detail.get("min_confidence", 0)
+                        max_conf = detail.get("max_confidence", 0)
+                        st.success(f"Page {page_num}: ✅ {num_det} text detections | Confidence: {conf:.2f} (min: {min_conf:.2f}, max: {max_conf:.2f})")
+                    else:
+                        st.success(f"Page {page_num}: ✅ {chars:,} characters extracted")
                 else:
                     st.error(f"Page {page_num}: ❌ {detail.get('error', status)}")
             
